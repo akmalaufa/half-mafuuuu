@@ -126,7 +126,7 @@ class HAM(nn.Module):
 
 # MAF block (stack of HAMs)
 class MAF(nn.Module):
-    def __init__(self, channels, depth=6):
+    def __init__(self, channels, depth=2):
         super().__init__()
         self.blocks = nn.Sequential(*[HAM(channels) for _ in range(depth)])
     def forward(self, x): return self.blocks(x)

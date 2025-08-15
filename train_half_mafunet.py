@@ -504,7 +504,7 @@ def main():
     parser.add_argument('--data_root', type=str, default='dataset', help='folder with train/ val/ test/')
     parser.add_argument('--img_size', type=int, nargs=2, default=[288, 384])
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=0.001, help='initial learning rate')
     parser.add_argument('--base_c', type=int, default=16)
     parser.add_argument('--maf_depth', type=int, default=2)

@@ -126,7 +126,7 @@ def main():
     ap.add_argument("--out_ch", type=int, default=1)
     ap.add_argument("--base_c", type=int, default=16)
     ap.add_argument("--maf_depth", type=int, default=2)
-    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--thr", type=float, default=0.5)

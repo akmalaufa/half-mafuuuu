@@ -412,6 +412,14 @@ class MAFUNet(nn.Module):
         x = self.head(x)
         return x
 
+    def freeze_backbone(self):
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+
+    def unfreeze_backbone(self):
+        for p in self.encoder.parameters():
+            p.requires_grad = True
+
 
 # Quick test
 if __name__ == "__main__":

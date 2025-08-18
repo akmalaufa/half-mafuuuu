@@ -178,8 +178,8 @@ def calculate_metrics(pred, target, threshold=0.5):
     return f1, iou, dice
 
 
-def apply_morph_closing(mask, ksize=3, iters=1):
-    mask_np = (mask.squeeze(0).cpu().numpy() > 0.5).astype(np.uint8) * 255
+def apply_morph_closing(mask, ksize=3, iters=1, threshold=0.5):
+    mask_np = (mask.squeeze(0).cpu().numpy() > threshold).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
     closed = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel, iterations=iters)
     closed = torch.from_numpy((closed > 127).astype(np.float32))[None, ...]
@@ -255,7 +255,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, mixup_alpha=0.0
     }
 
 # Validation Function
-def validate_epoch(model, dataloader, criterion, device, postprocess=None, vis_dir=None, epoch=0, writer: SummaryWriter = None, num_visualize=4):
+def validate_epoch(model, dataloader, criterion, device, postprocess=None, vis_dir=None, epoch=0, writer: SummaryWriter = None, num_visualize=4, threshold_search: bool = False, morph_ksize: int = 3):
     model.eval()
     total_loss = 0
     total_f1 = 0
@@ -263,7 +263,8 @@ def validate_epoch(model, dataloader, criterion, device, postprocess=None, vis_d
     total_dice = 0
     all_targets = []
     all_preds = []
-    
+    probs_all = []
+    masks_all = []
     with torch.no_grad():
         pbar = tqdm(dataloader, desc='Validation')
         for batch_idx, (images, masks) in enumerate(pbar):
@@ -274,10 +275,12 @@ def validate_epoch(model, dataloader, criterion, device, postprocess=None, vis_d
             loss = criterion(outputs, masks)
             
             probs = torch.sigmoid(outputs)
+            probs_all.append(probs.cpu())
+            masks_all.append(masks.cpu())
             if postprocess == 'morph':
                 bin_preds = []
                 for b in range(probs.size(0)):
-                    bin_pred = apply_morph_closing(probs[b])
+                    bin_pred = apply_morph_closing(probs[b], ksize=morph_ksize, threshold=0.5)
                     bin_preds.append(bin_pred)
                 preds_bin = torch.stack(bin_preds, dim=0).to(masks.device)
             elif postprocess == 'crf':
@@ -341,6 +344,21 @@ def validate_epoch(model, dataloader, criterion, device, postprocess=None, vis_d
     specificity = tn / (tn + fp + 1e-6)
     accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-6)
     metrics.update({'precision': precision, 'sen': recall, 'spe': specificity, 'acc': accuracy})
+
+    # Threshold search (maximize IoU on raw probabilities)
+    if threshold_search and len(probs_all) > 0:
+        probs_cat = torch.cat(probs_all, dim=0)
+        masks_cat = torch.cat(masks_all, dim=0)
+        best_thr, best_iou = 0.5, -1.0
+        for thr in [x/100.0 for x in range(30, 71, 2)]:  # 0.30..0.70 step 0.02
+            preds_thr = (probs_cat > thr).float()
+            inter = (preds_thr * masks_cat).sum().item()
+            union = (preds_thr + masks_cat - preds_thr * masks_cat).sum().item()
+            iou_thr = inter / (union + 1e-6)
+            if iou_thr > best_iou:
+                best_iou = iou_thr
+                best_thr = thr
+        metrics['best_threshold'] = best_thr
 
     return metrics
 
@@ -487,6 +505,9 @@ def main():
     parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout rate')
     parser.add_argument('--mixup_alpha', type=float, default=0.0, help='MixUp alpha (0 disables)')
     parser.add_argument('--postprocess', type=str, default='none', choices=['none', 'morph', 'crf'], help='Validation post-processing')
+    parser.add_argument('--morph_ksize', type=int, default=3, help='Kernel size for morphological closing (odd number)')
+    parser.add_argument('--threshold_search', action='store_true', help='Search best probability threshold on validation')
+    parser.add_argument('--freeze_backbone_epochs', type=int, default=0, help='Freeze backbone for N initial epochs')
     parser.add_argument('--early_patience', type=int, default=20, help='Early stopping patience on mIoU')
     parser.add_argument('--min_delta', type=float, default=1e-4, help='Early stopping min delta')
     parser.add_argument('--backbone', type=str, default='mobilenetv3_small_050', help='timm backbone variant')
@@ -576,12 +597,24 @@ def main():
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print("-" * 50)
         
+        # Optionally freeze backbone for warmup epochs
+        if args.freeze_backbone_epochs > 0 and epoch < args.freeze_backbone_epochs:
+            if hasattr(model, 'freeze_backbone'):
+                model.freeze_backbone()
+        else:
+            if hasattr(model, 'unfreeze_backbone'):
+                model.unfreeze_backbone()
+
         # Train
         train_results = train_epoch(model, train_loader, criterion, optimizer, device, mixup_alpha=args.mixup_alpha)
         
         # Validate
         vis_dir = os.path.join(args.save_dir, 'viz')
-        val_results = validate_epoch(model, val_loader, criterion, device, postprocess=args.postprocess, vis_dir=vis_dir, epoch=epoch, writer=writer)
+        val_results = validate_epoch(
+            model, val_loader, criterion, device,
+            postprocess=args.postprocess, vis_dir=vis_dir, epoch=epoch, writer=writer,
+            threshold_search=args.threshold_search, morph_ksize=args.morph_ksize
+        )
         
         # Update scheduler
         if scheduler:

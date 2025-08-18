@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    import timm
+except Exception:
+    timm = None
 
 class ConvBNAct(nn.Module):
     def __init__(self, in_c, out_c, k=3, s=1, p=None, g=1, act=nn.ReLU(inplace=True)):
@@ -266,93 +270,147 @@ class BridgeAttention(nn.Module):
         return self.refine(x)
 
 
-# Enhanced MAFU-Net with large kernels throughout for better performance
-class MAFUNet(nn.Module):
-    def __init__(self, in_ch=3, out_ch=1, base_c=16, maf_depth=2, dropout_rate=0.1):
+#############################
+# Lightweight building blocks
+#############################
+
+class GhostModule(nn.Module):
+    def __init__(self, in_channels, out_channels, ratio=2, kernel_size=1, dw_kernel_size=3, stride=1, relu=True):
         super().__init__()
-        C = base_c
-        self.dropout_rate = dropout_rate
-
-        # Enhanced stem with large kernels
-        self.stem = nn.Sequential(
-            LargeKernelConv(in_ch, C, 7),  # Large kernel 7x7
-            LargeKernelConv(C, C, 7),      # Large kernel 7x7
-            nn.Dropout2d(dropout_rate)
+        init_channels = int(out_channels / ratio)
+        new_channels = out_channels - init_channels
+        self.primary_conv = nn.Sequential(
+            nn.Conv2d(in_channels, init_channels, kernel_size, stride, kernel_size // 2 if kernel_size > 1 else 0, bias=False),
+            nn.BatchNorm2d(init_channels),
+            nn.ReLU(inplace=True) if relu else nn.Identity(),
         )
-
-        # Encoder channels
-        self.enc1 = Down(C,   2*C, maf_depth)  # 1/2
-        self.enc2 = Down(2*C, 4*C, maf_depth)  # 1/4
-        self.enc3 = Down(4*C, 8*C, maf_depth)  # 1/8
-        self.enc4 = Down(8*C,16*C, maf_depth)  # 1/16
-        self.enc5 = Down(16*C,32*C, maf_depth) # 1/32 (bottom)
-
-        # Enhanced bridge attention with large kernels
-        self.bridge0 = BridgeAttention(C)       # stem
-        self.bridge1 = BridgeAttention(2*C)
-        self.bridge2 = BridgeAttention(4*C)
-        self.bridge3 = BridgeAttention(8*C)
-        self.bridge4 = BridgeAttention(16*C)
-        self.bridge5 = BridgeAttention(32*C)
-
-        # Lateral projections with large kernels to align channels before fusion (all -> C)
-        self.lat0 = LargeKernelConv(C,     C, 7)
-        self.lat1 = LargeKernelConv(2*C,   C, 7)
-        self.lat2 = LargeKernelConv(4*C,   C, 7)
-        self.lat3 = LargeKernelConv(8*C,   C, 7)
-        self.lat4 = LargeKernelConv(16*C,  C, 7)
-        self.lat5 = LargeKernelConv(32*C,  C, 7)
-
-        # Enhanced fusion head with large kernels
-        self.fuse = nn.Sequential(
-            LargeKernelConv(6*C, 2*C, 7),  # Large kernel fusion
-            nn.Dropout2d(dropout_rate),
-            LargeKernelConv(2*C,   C, 7),   # Large kernel refinement
-            nn.Dropout2d(dropout_rate)
-        )
-
-        # Enhanced prediction head with large kernel
-        self.head = nn.Sequential(
-            LargeKernelConv(C, C, 7, act=nn.SiLU(inplace=True)),
-            nn.Conv2d(C, out_ch, kernel_size=1)
+        self.cheap_operation = nn.Sequential(
+            nn.Conv2d(init_channels, new_channels, dw_kernel_size, 1, dw_kernel_size // 2, groups=init_channels, bias=False),
+            nn.BatchNorm2d(new_channels),
+            nn.ReLU(inplace=True) if relu else nn.Identity(),
         )
 
     def forward(self, x):
-        B, _, H, W = x.shape
+        x1 = self.primary_conv(x)
+        x2 = self.cheap_operation(x1)
+        return torch.cat([x1, x2], dim=1)
 
-        # Stem and encoder
-        x0 = self.stem(x)          # B x C x H x W
-        s0 = self.bridge0(x0)      # attentioned skip at HxW
 
-        x1 = self.enc1(x0)         # B x 2C x H/2
-        s1 = self.bridge1(x1)
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, act=True):
+        super().__init__()
+        padding = kernel_size // 2
+        self.dw = nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding, groups=in_channels, bias=False)
+        self.pw = nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
 
-        x2 = self.enc2(x1)         # B x 4C x H/4
-        s2 = self.bridge2(x2)
+    def forward(self, x):
+        x = self.dw(x)
+        x = self.pw(x)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
 
-        x3 = self.enc3(x2)         # B x 8C x H/8
-        s3 = self.bridge3(x3)
 
-        x4 = self.enc4(x3)         # B x 16C x H/16
-        s4 = self.bridge4(x4)
+class LightweightSE(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        hidden = max(channels // reduction, 4)
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, hidden, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, channels, 1, bias=True),
+            nn.Sigmoid(),
+        )
 
-        x5 = self.enc5(x4)         # B x 32C x H/32
-        s5 = self.bridge5(x5)
+    def forward(self, x):
+        w = self.avg(x)
+        w = self.fc(w)
+        return x * w
 
-        # Align channels and upsample all to HxW (simple top-down fusion)
-        f0 = self.lat0(s0)
-        f1 = F.interpolate(self.lat1(s1), size=(H, W), mode='bilinear', align_corners=True)
-        f2 = F.interpolate(self.lat2(s2), size=(H, W), mode='bilinear', align_corners=True)
-        f3 = F.interpolate(self.lat3(s3), size=(H, W), mode='bilinear', align_corners=True)
-        f4 = F.interpolate(self.lat4(s4), size=(H, W), mode='bilinear', align_corners=True)
-        f5 = F.interpolate(self.lat5(s5), size=(H, W), mode='bilinear', align_corners=True)
 
-        # Concatenate and fuse
-        fused = torch.cat([f0, f1, f2, f3, f4, f5], dim=1)  # B x 6C x H x W
-        fused = self.fuse(fused)                            # B x C x H x W
+class GhostDSBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout=0.1):
+        super().__init__()
+        self.reduce = nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=False)
+        self.bn0 = nn.BatchNorm2d(out_channels)
+        self.ghost = GhostModule(out_channels, out_channels, ratio=2, kernel_size=1, dw_kernel_size=3, relu=True)
+        self.ds = DepthwiseSeparableConv(out_channels, out_channels, kernel_size=3, act=True)
+        self.se = LightweightSE(out_channels, reduction=8)
+        self.drop = nn.Dropout2d(dropout) if dropout and dropout > 0 else nn.Identity()
 
-        logits = self.head(fused)
-        return logits
+    def forward(self, x):
+        x = self.reduce(x)
+        x = self.bn0(x)
+        x = F.silu(x, inplace=True)
+        x = self.ghost(x)
+        x = self.ds(x)
+        x = self.se(x)
+        x = self.drop(x)
+        return x
+
+
+class FPNDecoder(nn.Module):
+    def __init__(self, in_channels_list, out_channels=16, dropout=0.1):
+        super().__init__()
+        self.laterals = nn.ModuleList([nn.Conv2d(c, out_channels, 1, 1, 0, bias=False) for c in in_channels_list])
+        self.blocks = nn.ModuleList([GhostDSBlock(out_channels, out_channels, dropout=dropout) for _ in in_channels_list])
+
+    def forward(self, feats):
+        # feats: list of feature maps high->low spatial resolution order [C4, C3, C2, C1]
+        lat = [l(f) for l, f in zip(self.laterals, feats)]
+        x = lat[0]
+        outputs = [self.blocks[0](x)]
+        for i in range(1, len(lat)):
+            x = F.interpolate(x, size=lat[i].shape[2:], mode='bilinear', align_corners=True) + lat[i]
+            x = self.blocks[i](x)
+            outputs.append(x)
+        # return finest scale
+        return outputs[-1]
+
+
+class MAFUNet(nn.Module):
+    def __init__(self, in_ch=3, out_ch=1, base_c=16, maf_depth=2, dropout_rate=0.1, backbone_name: str = 'mobilenetv3_small_050'):
+        super().__init__()
+        assert timm is not None, "timm is required for MobileNetV3 backbone. Please install timm."
+        # Pretrained MobileNetV3-Small backbone; rely on default feature outputs
+        # Robust creation: try requested pretrained; fallback to default pretrained; finally no-pretrained
+        enc = None
+        try:
+            enc = timm.create_model(backbone_name, pretrained=True, features_only=True)
+        except Exception:
+            try:
+                enc = timm.create_model('mobilenetv3_small_100', pretrained=True, features_only=True)
+            except Exception:
+                enc = timm.create_model(backbone_name, pretrained=False, features_only=True)
+        self.encoder = enc
+        enc_channels = self.encoder.feature_info.channels()
+        if len(enc_channels) < 4:
+            raise RuntimeError(f"Backbone {backbone_name} must provide at least 4 feature maps, got {len(enc_channels)}")
+
+        # Take last 4 stages, ordered deepest->shallowest for FPN
+        in_list = enc_channels[-1:-5:-1]
+        # Build lightweight FPN decoder with small channel width to fit param budget
+        self.decoder_out_channels = base_c  # keep tiny to meet param budget
+        self.decoder = FPNDecoder(in_list, out_channels=self.decoder_out_channels, dropout=dropout_rate)
+
+        # Final prediction head
+        self.head = nn.Sequential(
+            GhostDSBlock(self.decoder_out_channels, self.decoder_out_channels, dropout=dropout_rate),
+            nn.Conv2d(self.decoder_out_channels, out_ch, kernel_size=1)
+        )
+
+    def forward(self, x):
+        H, W = x.shape[2:]
+        feats = self.encoder(x)
+        # Arrange as [C4, C3, C2, C1] deepest->shallowest
+        feats = feats[-1:-5:-1]
+        x = self.decoder(feats)
+        x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=True)
+        x = self.head(x)
+        return x
 
 
 # Quick test

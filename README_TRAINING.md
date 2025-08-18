@@ -15,6 +15,13 @@ pip install -r requirements.txt
 python test_model.py
 ```
 
+Windows note (optional DenseCRF):
+- DenseCRF (pydensecrf) bersifat opsional. Di Windows sering perlu Microsoft Visual C++ Build Tools.
+- Jika tidak terpasang, gunakan `--postprocess morph` saat validasi/test. Jika ingin CRF:
+```bash
+pip install -r requirements-optional-crf.txt
+```
+
 ### 3. Start Training
 ```bash
 python train.py --epochs 150 --batch_size 12 --lr 1e-4
@@ -80,6 +87,11 @@ python train.py \
     --maf_depth 2 \
     --dropout_rate 0.1 \
     --scheduler cosine
+```
+
+Parameter budget 500K–700K (disarankan):
+```bash
+python train.py --backbone mobilenetv3_small_075 --base_channels 8
 ```
 
 ### Resume Training

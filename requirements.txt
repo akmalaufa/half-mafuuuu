@@ -7,3 +7,13 @@ scikit-learn>=1.1.0
 tqdm>=4.64.0
 opencv-python>=4.6.0
 tensorboard>=2.10.0
+albumentations>=1.3.0
+seaborn>=0.12.0
+# timm versi stabil yang teruji pada proyek ini
+timm==1.0.19
+thop>=0.1.1.post220907
+
+# Catatan Windows:
+# - DenseCRF (pydensecrf) bersifat OPSIONAL dan sering gagal build di Windows tanpa Microsoft C++ Build Tools.
+# - Jika ingin mengaktifkan CRF, install dari file tambahan: requirements-optional-crf.txt
+#   pip install -r requirements-optional-crf.txt

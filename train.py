@@ -1,17 +1,36 @@
 import os
+import time
+import argparse
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import numpy as np
-from PIL import Image
-import matplotlib.pyplot as plt
-from sklearn.metrics import f1_score, jaccard_score
-import time
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid
+
+from sklearn.metrics import f1_score, jaccard_score, confusion_matrix
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import cv2
+
+try:
+    import pydensecrf.densecrf as dcrf
+    from pydensecrf.utils import unary_from_softmax
+except Exception:
+    dcrf = None
+
 from tqdm import tqdm
-import argparse
 from half_mafunet import MAFUNet
+try:
+    from thop import profile as thop_profile
+except Exception:
+    thop_profile = None
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -22,48 +41,70 @@ if torch.cuda.is_available():
 
 # Custom Dataset
 class SegmentationDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, transform=None, mask_transform=None):
+    def __init__(self, image_dir, mask_dir, aug=None):
         self.image_dir = image_dir
         self.mask_dir = mask_dir
-        self.transform = transform
-        self.mask_transform = mask_transform
-        
+        self.aug = aug
+
         self.images = sorted([f for f in os.listdir(image_dir) if f.endswith('.png')])
         self.masks = sorted([f for f in os.listdir(mask_dir) if f.endswith('.png')])
-        
+
         assert len(self.images) == len(self.masks), "Number of images and masks must match"
-        
+
     def __len__(self):
         return len(self.images)
-    
+
     def __getitem__(self, idx):
         img_path = os.path.join(self.image_dir, self.images[idx])
         mask_path = os.path.join(self.mask_dir, self.masks[idx])
-        
-        image = Image.open(img_path).convert('RGB')
-        mask = Image.open(mask_path).convert('L')
-        
-        if self.transform:
-            image = self.transform(image)
-        if self.mask_transform:
-            mask = self.mask_transform(mask)
-        
-        return image, mask
+
+        image = np.array(Image.open(img_path).convert('RGB'))
+        mask = np.array(Image.open(mask_path).convert('L'))
+        mask = (mask > 0).astype(np.uint8)
+
+        if self.aug is not None:
+            augmented = self.aug(image=image, mask=mask)
+            image = augmented['image']
+            mask = augmented['mask']
+
+        if mask.ndim == 2:
+            mask = mask[None, ...]
+
+        return image.float(), mask.float()
 
 # Data Transforms
-def get_transforms(image_size=(384, 288)):
-    image_transform = transforms.Compose([
-        transforms.Resize(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+def get_train_aug(image_size=(384, 288), strong=True, clahe=True):
+    h, w = image_size[1], image_size[0]
+    transforms_list = []
+    if strong:
+        if clahe:
+            transforms_list.append(A.CLAHE(p=0.3))
+        transforms_list += [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.2),
+            A.RandomRotate90(p=0.3),
+            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, p=0.7, border_mode=cv2.BORDER_REFLECT101),
+            A.ElasticTransform(alpha=50, sigma=7, p=0.2),
+            A.GridDistortion(num_steps=5, distort_limit=0.2, p=0.2),
+            A.RandomBrightnessContrast(p=0.3),
+            A.HueSaturationValue(p=0.2),
+            A.GaussNoise(p=0.2),
+        ]
+    transforms_list += [
+        A.Resize(h, w, interpolation=cv2.INTER_LINEAR),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ]
+    return A.Compose(transforms_list)
+
+
+def get_val_aug(image_size=(384, 288)):
+    h, w = image_size[1], image_size[0]
+    return A.Compose([
+        A.Resize(h, w, interpolation=cv2.INTER_NEAREST),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
     ])
-    
-    mask_transform = transforms.Compose([
-        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.NEAREST),
-        transforms.ToTensor()
-    ])
-    
-    return image_transform, mask_transform
 
 # Loss Functions
 class DiceLoss(nn.Module):
@@ -80,22 +121,44 @@ class DiceLoss(nn.Module):
         dice = (2. * intersection + self.smooth) / (pred_flat.sum() + target_flat.sum() + self.smooth)
         return 1 - dice
 
+
+class IoULoss(nn.Module):
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        pred = torch.sigmoid(pred)
+        pred_flat = pred.view(-1)
+        target_flat = target.view(-1)
+        intersection = (pred_flat * target_flat).sum()
+        union = pred_flat.sum() + target_flat.sum() - intersection
+        iou = (intersection + self.smooth) / (union + self.smooth)
+        return 1 - iou
+
 class CombinedLoss(nn.Module):
-    def __init__(self, bce_weight=0.5, dice_weight=0.5):
-        super(CombinedLoss, self).__init__()
-        self.bce_weight = bce_weight
-        self.dice_weight = dice_weight
+    def __init__(self, bce_w=0.5, dice_w=0.25, iou_w=0.25):
+        super().__init__()
+        self.bce_w = bce_w
+        self.dice_w = dice_w
+        self.iou_w = iou_w
         self.bce = nn.BCEWithLogitsLoss()
         self.dice = DiceLoss()
-        
+        self.iou = IoULoss()
+
     def forward(self, pred, target):
         bce_loss = self.bce(pred, target)
         dice_loss = self.dice(pred, target)
-        return self.bce_weight * bce_loss + self.dice_weight * dice_loss
+        iou_loss = self.iou(pred, target)
+        return self.bce_w * bce_loss + self.dice_w * dice_loss + self.iou_w * iou_loss
 
 # Metrics
 def calculate_metrics(pred, target, threshold=0.5):
-    pred_binary = (torch.sigmoid(pred) > threshold).float()
+    # Accept logits or probabilities/binary. If in [0,1], skip sigmoid.
+    if torch.is_floating_point(pred) and pred.min().item() >= 0.0 and pred.max().item() <= 1.0:
+        pred_binary = (pred > threshold).float()
+    else:
+        pred_binary = (torch.sigmoid(pred) > threshold).float()
     target_binary = target.float()
     
     # Convert to numpy for sklearn metrics
@@ -114,8 +177,33 @@ def calculate_metrics(pred, target, threshold=0.5):
     
     return f1, iou, dice
 
+
+def apply_morph_closing(mask, ksize=3, iters=1):
+    mask_np = (mask.squeeze(0).cpu().numpy() > 0.5).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    closed = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel, iterations=iters)
+    closed = torch.from_numpy((closed > 127).astype(np.float32))[None, ...]
+    return closed
+
+
+def apply_densecrf(image_tensor, prob_map):
+    if dcrf is None:
+        return (prob_map > 0.5).float()
+    im = (image_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+    H, W = im.shape[:2]
+    probs = np.vstack([1 - prob_map.cpu().numpy().reshape(1, H, W), prob_map.cpu().numpy().reshape(1, H, W)])
+    unary = unary_from_softmax(probs)
+    unary = np.ascontiguousarray(unary)
+    d = dcrf.DenseCRF2D(W, H, 2)
+    d.setUnaryEnergy(unary)
+    d.addPairwiseGaussian(sxy=3, compat=3)
+    d.addPairwiseBilateral(sxy=50, srgb=13, rgbim=im, compat=5)
+    Q = d.inference(5)
+    pred = np.argmax(np.array(Q), axis=0).reshape(H, W)
+    return torch.from_numpy(pred.astype(np.float32))[None, ...]
+
 # Training Function
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, device, mixup_alpha=0.0):
     model.train()
     total_loss = 0
     total_f1 = 0
@@ -128,8 +216,16 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         masks = masks.to(device)
         
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, masks)
+        if mixup_alpha > 0:
+            lam = np.random.beta(mixup_alpha, mixup_alpha)
+            batch_indices = torch.randperm(images.size(0)).to(device)
+            images_mix = lam * images + (1 - lam) * images[batch_indices]
+            masks_mix = lam * masks + (1 - lam) * masks[batch_indices]
+            outputs = model(images_mix)
+            loss = criterion(outputs, masks_mix)
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, masks)
         
         loss.backward()
         optimizer.step()
@@ -159,12 +255,14 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     }
 
 # Validation Function
-def validate_epoch(model, dataloader, criterion, device):
+def validate_epoch(model, dataloader, criterion, device, postprocess=None, vis_dir=None, epoch=0, writer: SummaryWriter = None, num_visualize=4):
     model.eval()
     total_loss = 0
     total_f1 = 0
     total_iou = 0
     total_dice = 0
+    all_targets = []
+    all_preds = []
     
     with torch.no_grad():
         pbar = tqdm(dataloader, desc='Validation')
@@ -175,13 +273,30 @@ def validate_epoch(model, dataloader, criterion, device):
             outputs = model(images)
             loss = criterion(outputs, masks)
             
-            # Calculate metrics
-            f1, iou, dice = calculate_metrics(outputs, masks)
+            probs = torch.sigmoid(outputs)
+            if postprocess == 'morph':
+                bin_preds = []
+                for b in range(probs.size(0)):
+                    bin_pred = apply_morph_closing(probs[b])
+                    bin_preds.append(bin_pred)
+                preds_bin = torch.stack(bin_preds, dim=0).to(masks.device)
+            elif postprocess == 'crf':
+                preds_bin = []
+                for b in range(probs.size(0)):
+                    pred_b = apply_densecrf(images[b].cpu(), probs[b].cpu())
+                    preds_bin.append(pred_b)
+                preds_bin = torch.stack(preds_bin, dim=0).to(masks.device)
+            else:
+                preds_bin = (probs > 0.5).float()
+
+            f1, iou, dice = calculate_metrics(preds_bin, masks)
             
             total_loss += loss.item()
             total_f1 += f1
             total_iou += iou
             total_dice += dice
+            all_targets.append(masks.cpu().numpy().astype(np.uint8))
+            all_preds.append(preds_bin.cpu().numpy().astype(np.uint8))
             
             # Update progress bar
             pbar.set_postfix({
@@ -191,13 +306,78 @@ def validate_epoch(model, dataloader, criterion, device):
                 'Dice': f'{dice:.4f}'
             })
     
+    # Visualization samples
+    if writer is not None and vis_dir is not None:
+        os.makedirs(vis_dir, exist_ok=True)
+        imgs = images[:num_visualize].cpu()
+        gts = masks[:num_visualize].cpu()
+        prb = torch.sigmoid(outputs[:num_visualize].cpu())
+        prd = (prb > 0.5).float()
+        grid = make_grid(torch.cat([imgs, gts.repeat(1,3,1,1), prb.repeat(1,3,1,1), prd.repeat(1,3,1,1)], dim=0), nrow=num_visualize)
+        writer.add_image('val/samples', grid, epoch)
+
     num_batches = len(dataloader)
-    return {
+    metrics = {
         'loss': total_loss / num_batches,
         'f1': total_f1 / num_batches,
         'iou': total_iou / num_batches,
         'dice': total_dice / num_batches
     }
+
+    y_true = np.concatenate([t.reshape(-1) for t in all_targets], axis=0)
+    y_pred = np.concatenate([p.reshape(-1) for p in all_preds], axis=0)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    fig = plt.figure(figsize=(4, 3))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['BG', 'Polyp'], yticklabels=['BG', 'Polyp'])
+    plt.xlabel('Predicted'); plt.ylabel('True'); plt.title('Confusion Matrix')
+    if writer is not None:
+        writer.add_figure('val/confusion_matrix', fig, epoch)
+    plt.close(fig)
+
+    # Derive metrics from confusion matrix (binary)
+    tn, fp, fn, tp = cm.ravel().tolist()
+    precision = tp / (tp + fp + 1e-6)
+    recall = tp / (tp + fn + 1e-6)  # sensitivity
+    specificity = tn / (tn + fp + 1e-6)
+    accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-6)
+    metrics.update({'precision': precision, 'sen': recall, 'spe': specificity, 'acc': accuracy})
+
+    return metrics
+
+def compute_model_flops_params(model: nn.Module, image_size):
+    # image_size is [W, H]
+    H, W = int(image_size[1]), int(image_size[0])
+    if thop_profile is None:
+        return None, sum(p.numel() for p in model.parameters())
+    device_tmp = next(model.parameters()).device
+    with torch.no_grad():
+        dummy = torch.randn(1, 3, H, W, device=device_tmp)
+        flops, params = thop_profile(model, inputs=(dummy,), verbose=False)
+    return flops, params
+
+def print_paper_results(params, flops, val_metrics):
+    # params in number, flops in number of operations
+    params_m = params / 1e6 if params is not None else None
+    flops_g = (flops / 1e9) if (flops is not None) else None
+    lines = []
+    lines.append("================ Results (Paper) ===============")
+    if params_m is not None:
+        lines.append(f"Params(M)  : {params_m:.3f}")
+    if flops_g is not None:
+        lines.append(f"FLOPs(G)   : {flops_g:.3f} (GMAcs)")
+    if 'iou' in val_metrics:
+        lines.append(f"mIoU       : {val_metrics['iou']*100:.2f}")
+    if 'f1' in val_metrics:
+        lines.append(f"F1/Dice (FG): {val_metrics['f1']*100:.2f}")
+    if 'precision' in val_metrics:
+        lines.append(f"Precision  : {val_metrics['precision']*100:.2f}")
+    if 'sen' in val_metrics:
+        lines.append(f"SEN        : {val_metrics['sen']*100:.2f}")
+    if 'acc' in val_metrics:
+        lines.append(f"ACC        : {val_metrics['acc']*100:.2f}")
+    if 'spe' in val_metrics:
+        lines.append(f"SPE        : {val_metrics['spe']*100:.2f}")
+    print("\n".join(lines))
 
 # Learning Rate Scheduler
 def get_scheduler(optimizer, scheduler_type='cosine', num_epochs=100):
@@ -230,6 +410,22 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     if scheduler and checkpoint['scheduler_state_dict']:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     return checkpoint['epoch'], checkpoint['metrics']
+
+class EarlyStopping:
+    def __init__(self, patience=20, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = -np.inf
+        self.counter = 0
+
+    def step(self, value):
+        improved = value > (self.best + self.min_delta)
+        if improved:
+            self.best = value
+            self.counter = 0
+        else:
+            self.counter += 1
+        return improved, self.counter >= self.patience
 
 # Plot Training Curves
 def plot_training_curves(train_metrics, val_metrics, save_path):
@@ -285,35 +481,40 @@ def main():
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--weight_decay', type=float, default=5e-4, help='Weight decay')
     parser.add_argument('--base_channels', type=int, default=16, help='Base channels for model')
     parser.add_argument('--maf_depth', type=int, default=2, help='MAF block depth')
     parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout rate')
+    parser.add_argument('--mixup_alpha', type=float, default=0.0, help='MixUp alpha (0 disables)')
+    parser.add_argument('--postprocess', type=str, default='none', choices=['none', 'morph', 'crf'], help='Validation post-processing')
+    parser.add_argument('--early_patience', type=int, default=20, help='Early stopping patience on mIoU')
+    parser.add_argument('--min_delta', type=float, default=1e-4, help='Early stopping min delta')
+    parser.add_argument('--backbone', type=str, default='mobilenetv3_small_050', help='timm backbone variant')
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'step', 'plateau'], help='Learning rate scheduler')
     parser.add_argument('--resume', type=str, default='', help='Resume from checkpoint')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Save directory')
+    parser.add_argument('--log_dir', type=str, default='./runs', help='TensorBoard log dir')
     
     args = parser.parse_args()
     
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
     
-    # Data transforms
-    image_transform, mask_transform = get_transforms(args.image_size)
-    
+    # Data transforms (Albumentations)
+    train_aug = get_train_aug(args.image_size, strong=True, clahe=True)
+    val_aug = get_val_aug(args.image_size)
+
     # Datasets
     train_dataset = SegmentationDataset(
         os.path.join(args.data_dir, 'train', 'images'),
         os.path.join(args.data_dir, 'train', 'masks'),
-        transform=image_transform,
-        mask_transform=mask_transform
+        aug=train_aug
     )
-    
+
     val_dataset = SegmentationDataset(
         os.path.join(args.data_dir, 'val', 'images'),
         os.path.join(args.data_dir, 'val', 'masks'),
-        transform=image_transform,
-        mask_transform=mask_transform
+        aug=val_aug
     )
     
     # Data loaders
@@ -329,7 +530,8 @@ def main():
         out_ch=1,
         base_c=args.base_channels,
         maf_depth=args.maf_depth,
-        dropout_rate=args.dropout_rate
+        dropout_rate=args.dropout_rate,
+        backbone_name=args.backbone
     ).to(device)
     
     # Count parameters
@@ -337,9 +539,12 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+    if not (500_000 <= total_params <= 700_000):
+        print(f"[Warning] Parameter count {total_params:,} is outside target [500K, 700K].")
+        print("          Try: --backbone mobilenetv3_small_050 and lower --base_channels (e.g., 8) to reduce params.")
     
     # Loss function
-    criterion = CombinedLoss(bce_weight=0.3, dice_weight=0.7)
+    criterion = CombinedLoss(bce_w=0.5, dice_w=0.25, iou_w=0.25)
     
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -351,14 +556,18 @@ def main():
     train_metrics = {'loss': [], 'f1': [], 'iou': [], 'dice': []}
     val_metrics = {'loss': [], 'f1': [], 'iou': [], 'dice': []}
     
+    writer = SummaryWriter(args.log_dir)
     start_epoch = 0
     best_f1 = 0
+    best_iou = 0
+    early = EarlyStopping(patience=args.early_patience, min_delta=args.min_delta)
     
     # Resume from checkpoint if specified
     if args.resume:
         start_epoch, checkpoint_metrics = load_checkpoint(model, optimizer, scheduler, args.resume)
         best_f1 = checkpoint_metrics.get('f1', 0)
-        print(f"Resumed from epoch {start_epoch} with best F1: {best_f1:.4f}")
+        best_iou = checkpoint_metrics.get('iou', 0)
+        print(f"Resumed from epoch {start_epoch} with best F1: {best_f1:.4f}, best IoU: {best_iou:.4f}")
     
     print(f"Starting training from epoch {start_epoch + 1}")
     
@@ -368,10 +577,11 @@ def main():
         print("-" * 50)
         
         # Train
-        train_results = train_epoch(model, train_loader, criterion, optimizer, device)
+        train_results = train_epoch(model, train_loader, criterion, optimizer, device, mixup_alpha=args.mixup_alpha)
         
         # Validate
-        val_results = validate_epoch(model, val_loader, criterion, device)
+        vis_dir = os.path.join(args.save_dir, 'viz')
+        val_results = validate_epoch(model, val_loader, criterion, device, postprocess=args.postprocess, vis_dir=vis_dir, epoch=epoch, writer=writer)
         
         # Update scheduler
         if scheduler:
@@ -389,6 +599,17 @@ def main():
         print(f"Train - Loss: {train_results['loss']:.4f}, F1: {train_results['f1']:.4f}, IoU: {train_results['iou']:.4f}, Dice: {train_results['dice']:.4f}")
         print(f"Val   - Loss: {val_results['loss']:.4f}, F1: {val_results['f1']:.4f}, IoU: {val_results['iou']:.4f}, Dice: {val_results['dice']:.4f}")
         print(f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+        # TensorBoard logging
+        writer.add_scalar('train/loss', train_results['loss'], epoch)
+        writer.add_scalar('train/f1', train_results['f1'], epoch)
+        writer.add_scalar('train/iou', train_results['iou'], epoch)
+        writer.add_scalar('train/dice', train_results['dice'], epoch)
+        writer.add_scalar('val/loss', val_results['loss'], epoch)
+        writer.add_scalar('val/f1', val_results['f1'], epoch)
+        writer.add_scalar('val/iou', val_results['iou'], epoch)
+        writer.add_scalar('val/dice', val_results['dice'], epoch)
+        writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
         
         # Save best model
         if val_results['f1'] > best_f1:
@@ -397,6 +618,14 @@ def main():
             save_checkpoint(model, optimizer, scheduler, epoch, val_results, best_checkpoint_path)
             print(f"New best F1: {best_f1:.4f} - Model saved!")
         
+        # Early stopping on mIoU
+        improved, should_stop = early.step(val_results['iou'])
+        if improved:
+            best_iou = val_results['iou']
+        if should_stop:
+            print(f"Early stopping triggered on mIoU. Best IoU: {best_iou:.4f}")
+            break
+
         # Save regular checkpoint
         if (epoch + 1) % 10 == 0:
             checkpoint_path = os.path.join(args.save_dir, f'checkpoint_epoch_{epoch + 1}.pth')
@@ -411,7 +640,7 @@ def main():
             plot_path = os.path.join(args.save_dir, 'training_curves.png')
             plot_training_curves(train_metrics, val_metrics, plot_path)
     
-    print(f"\nTraining completed! Best F1: {best_f1:.4f}")
+    print(f"\nTraining completed! Best F1: {best_f1:.4f}, Best IoU: {best_iou:.4f}")
     
     # Final plot
     plot_path = os.path.join(args.save_dir, 'final_training_curves.png')
@@ -419,7 +648,17 @@ def main():
     
     # Save final model
     final_checkpoint_path = os.path.join(args.save_dir, 'final_model.pth')
-    save_checkpoint(model, optimizer, scheduler, args.epochs - 1, val_results, final_checkpoint_path)
+    save_checkpoint(model, optimizer, scheduler, epoch, val_results, final_checkpoint_path)
+    writer.close()
+
+    # Print paper-style summary on final validation
+    flops, params = compute_model_flops_params(model, args.image_size)
+    # Use last val metrics to approximate summary
+    try:
+        last_val = {k: v[-1] for k, v in val_metrics.items()}
+    except Exception:
+        last_val = val_results
+    print_paper_results(params=params, flops=flops, val_metrics=last_val)
 
 if __name__ == '__main__':
     main()

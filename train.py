@@ -359,6 +359,27 @@ def validate_epoch(model, dataloader, criterion, device, postprocess=None, vis_d
                 best_iou = iou_thr
                 best_thr = thr
         metrics['best_threshold'] = best_thr
+        # Recompute confusion matrix & metrics at best threshold
+        preds_thr_np = (probs_cat.numpy() > best_thr).astype(np.uint8).reshape(-1)
+        masks_thr_np = masks_cat.numpy().astype(np.uint8).reshape(-1)
+        cm_thr = confusion_matrix(masks_thr_np, preds_thr_np, labels=[0, 1])
+        tn, fp, fn, tp = cm_thr.ravel().tolist()
+        precision = tp / (tp + fp + 1e-6)
+        recall = tp / (tp + fn + 1e-6)
+        specificity = tn / (tn + fp + 1e-6)
+        accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-6)
+        iou_thr = best_iou
+        dice_thr = (2 * tp) / (2 * tp + fp + fn + 1e-6)
+        f1_thr = dice_thr
+        metrics.update({'precision': precision, 'sen': recall, 'spe': specificity, 'acc': accuracy,
+                        'iou': iou_thr, 'dice': dice_thr, 'f1': f1_thr})
+        # Log tuned CM
+        if writer is not None:
+            fig2 = plt.figure(figsize=(4, 3))
+            sns.heatmap(cm_thr, annot=True, fmt='d', cmap='Greens', xticklabels=['BG', 'Polyp'], yticklabels=['BG', 'Polyp'])
+            plt.xlabel('Predicted'); plt.ylabel('True'); plt.title(f'Confusion Matrix (thr={best_thr:.2f})')
+            writer.add_figure('val/confusion_matrix_tuned', fig2, epoch)
+            plt.close(fig2)
 
     return metrics
 
@@ -515,6 +536,7 @@ def main():
     parser.add_argument('--resume', type=str, default='', help='Resume from checkpoint')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Save directory')
     parser.add_argument('--log_dir', type=str, default='./runs', help='TensorBoard log dir')
+    parser.add_argument('--num_workers', type=int, default=2, help='Number of DataLoader workers')
     
     args = parser.parse_args()
     
@@ -539,8 +561,8 @@ def main():
     )
     
     # Data loaders
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")

@@ -189,7 +189,15 @@ def apply_morph_closing(mask, ksize=3, iters=1, threshold=0.5):
 def apply_densecrf(image_tensor, prob_map):
     if dcrf is None:
         return (prob_map > 0.5).float()
-    im = (image_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+    # Convert normalized tensor back to uint8 RGB image and ensure C-contiguous
+    im_np = image_tensor.detach().cpu().numpy().transpose(1, 2, 0)
+    # Heuristic denormalization for ImageNet stats if looks normalized
+    if im_np.min() < 0.0 or im_np.max() > 1.0:
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        im_np = (im_np * std + mean)
+    im_np = np.clip(im_np, 0.0, 1.0)
+    im = np.ascontiguousarray((im_np * 255.0).astype(np.uint8))
     H, W = im.shape[:2]
     probs = np.vstack([1 - prob_map.cpu().numpy().reshape(1, H, W), prob_map.cpu().numpy().reshape(1, H, W)])
     unary = unary_from_softmax(probs)

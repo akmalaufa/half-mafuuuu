@@ -443,7 +443,12 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, save_path):
 
 # Load Checkpoint
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Compatible with PyTorch 2.6+ (weights_only default True)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        # Older torch without weights_only argument
+        checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     if scheduler and checkpoint['scheduler_state_dict']:
@@ -584,7 +589,10 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
     if not (500_000 <= total_params <= 700_000):
         print(f"[Warning] Parameter count {total_params:,} is outside target [500K, 700K].")
-        print("          Try: --backbone mobilenetv3_small_050 and lower --base_channels (e.g., 8) to reduce params.")
+        if total_params < 500_000:
+            print("          Suggestion: increase capacity, e.g., --backbone mobilenetv3_small_075 --base_channels 12-16.")
+        else:
+            print("          Suggestion: reduce capacity, e.g., --backbone mobilenetv3_small_050 --base_channels 8-12.")
     
     # Loss function
     criterion = CombinedLoss(bce_w=0.5, dice_w=0.25, iou_w=0.25)

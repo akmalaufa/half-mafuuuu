@@ -1,1 +1,5 @@
-pydensecrf>=1.0rc2
+scikit-build
+ninja
+cmake
+cython
+pydensecrf @ git+https://github.com/lucasb-eyer/pydensecrf.git

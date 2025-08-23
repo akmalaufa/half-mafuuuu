@@ -138,17 +138,45 @@ print(f"TensorBoard: {url}")
 
 ## 🚨 Troubleshooting
 
-### Dataset Path Error
+### **Dataset Path Error (Paling Umum)**
 ```bash
-# Error: FileNotFoundError: No such file or directory
-# Solusi: Gunakan script yang mendeteksi dataset otomatis
-!python kaggle_training_example.py
+# Error: ❌ No dataset found!
+# Solusi: Gunakan script debug dulu
 
-# Atau berikan path yang benar
-!python kaggle_train_simple.py --data_dir /kaggle/input/your-actual-dataset-name
+# 1. Debug dataset structure
+!python kaggle_debug_dataset.py
+
+# 2. Gunakan script robust
+!python kaggle_train_robust.py
+
+# 3. Atau script otomatis
+!python kaggle_training_example.py
 ```
 
-### GPU Out of Memory (OOM)
+### **Dataset Structure Issues**
+```bash
+# Pastikan struktur folder benar:
+your-dataset/
+├── train/
+│   ├── images/  (PNG files)
+│   └── masks/   (PNG files)
+└── val/
+    ├── images/  (PNG files)
+    └── masks/   (PNG files)
+
+# Jika struktur salah, gunakan:
+!python kaggle_debug_dataset.py
+```
+
+### **Dataset Upload Issues**
+```bash
+# 1. Upload ke Kaggle Datasets
+# 2. Atau upload langsung ke notebook
+# 3. Atau gunakan Kaggle API:
+!kaggle datasets download -d username/dataset-name
+```
+
+### **GPU Out of Memory (OOM)**
 ```bash
 # Solusi otomatis sudah ada di script
 # Jika manual, kurangi batch_size atau tambah grad_accum_steps
@@ -254,6 +282,8 @@ Jika ada masalah:
 
 ## 📚 Script Files
 
+- **`kaggle_debug_dataset.py`** - Script untuk debug dan cek struktur dataset
+- **`kaggle_train_robust.py`** - Script robust dengan deteksi dataset lengkap
 - **`kaggle_train_fast.py`** - Script paling sederhana, langsung jalankan training
 - **`kaggle_commands.py`** - Script yang tunjukkan commands yang bisa dijalankan
 - **`kaggle_training_example.py`** - Script otomatis dengan deteksi dataset

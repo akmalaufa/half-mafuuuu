@@ -46,13 +46,25 @@ Panduan lengkap untuk training model Half-MAFU-Net di Kaggle dengan optimasi GPU
 
 ## 🎯 Cara Training
 
-### **Option 1: Script Otomatis (Recommended)**
+### **Option 1: Script Paling Sederhana (Recommended)**
 ```bash
-# Jalankan script yang akan mendeteksi dataset otomatis
+# Jalankan script yang paling sederhana
+!python kaggle_train_fast.py
+```
+
+### **Option 2: Script dengan Commands**
+```bash
+# Script yang akan tunjukkan commands yang bisa dijalankan
+!python kaggle_commands.py
+```
+
+### **Option 3: Script Otomatis dengan Deteksi Dataset**
+```bash
+# Script yang akan mendeteksi dataset otomatis
 !python kaggle_training_example.py
 ```
 
-### **Option 2: Script Manual dengan Path Input**
+### **Option 4: Script Manual dengan Path Input**
 ```bash
 # Jalankan dengan dataset path yang spesifik
 !python kaggle_train_simple.py --data_dir /kaggle/input/your-dataset-name
@@ -64,9 +76,9 @@ Panduan lengkap untuk training model Half-MAFU-Net di Kaggle dengan optimasi GPU
   --batch_size 12
 ```
 
-### **Option 3: Command Manual**
+### **Option 5: Command Manual Langsung**
 ```bash
-# Stage A: Initial Training (dengan MixUp)
+# Copy-paste command ini langsung di notebook
 !python train.py \
   --epochs 200 \
   --batch_size 16 \
@@ -85,31 +97,8 @@ Panduan lengkap untuk training model Half-MAFU-Net di Kaggle dengan optimasi GPU
   --grad_accum_steps 2 \
   --persistent_workers \
   --data_dir /kaggle/input/your-dataset \
-  --save_dir /kaggle/working/checkpoints/stage_a \
-  --log_dir /kaggle/working/runs/stage_a
-
-# Stage B: Fine-tuning (tanpa MixUp)
-!python train.py \
-  --epochs 100 \
-  --batch_size 16 \
-  --image_size 512 384 \
-  --lr 8e-5 \
-  --scheduler cosine \
-  --backbone mobilenetv3_small_075 \
-  --base_channels 16 \
-  --resume /kaggle/working/checkpoints/stage_a/best_model.pth \
-  --postprocess crf \
-  --threshold_search \
-  --mixup_alpha 0.0 \
-  --freeze_backbone_epochs 0 \
-  --early_patience 30 \
-  --num_workers 4 \
-  --use_amp \
-  --grad_accum_steps 2 \
-  --persistent_workers \
-  --data_dir /kaggle/input/your-dataset \
-  --save_dir /kaggle/working/checkpoints/stage_b \
-  --log_dir /kaggle/working/runs/stage_b
+  --save_dir /kaggle/working/checkpoints \
+  --log_dir /kaggle/working/runs
 ```
 
 ## 🔧 Parameter Optimasi
@@ -224,8 +213,14 @@ Dengan optimasi ini, target yang diharapkan:
 ### **Untuk Pemula (Recommended):**
 ```python
 # 1. Upload dataset ke Kaggle
-# 2. Jalankan script otomatis
-!python kaggle_training_example.py
+# 2. Jalankan script paling sederhana
+!python kaggle_train_fast.py
+```
+
+### **Untuk User yang Mau Lihat Commands Dulu:**
+```python
+# Script akan tunjukkan commands yang tersedia
+!python kaggle_commands.py
 ```
 
 ### **Untuk Advanced User:**
@@ -259,6 +254,8 @@ Jika ada masalah:
 
 ## 📚 Script Files
 
+- **`kaggle_train_fast.py`** - Script paling sederhana, langsung jalankan training
+- **`kaggle_commands.py`** - Script yang tunjukkan commands yang bisa dijalankan
 - **`kaggle_training_example.py`** - Script otomatis dengan deteksi dataset
 - **`kaggle_train_simple.py`** - Script manual dengan command line arguments
 - **`train.py`** - Script training utama dengan semua optimasi

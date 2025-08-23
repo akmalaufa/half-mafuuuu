@@ -12,6 +12,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid
+from torch.cuda.amp import GradScaler, autocast
 
 from sklearn.metrics import f1_score, jaccard_score, confusion_matrix
 
@@ -32,12 +33,35 @@ try:
 except Exception:
     thop_profile = None
 
-# Set device
+# Set device and optimize for Kaggle GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
+
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name()}")
     print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    
+    # Kaggle GPU optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    
+    # Enable automatic mixed precision if available
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+        print("Automatic Mixed Precision (AMP) enabled")
+        use_amp = True
+    else:
+        print("AMP not available, using full precision")
+        use_amp = False
+    
+    # Set memory fraction for Kaggle (optional)
+    try:
+        torch.cuda.set_per_process_memory_fraction(0.95)
+        print("GPU memory fraction set to 95%")
+    except:
+        pass
+else:
+    use_amp = False
+    print("Running on CPU - training will be slow!")
 
 # Custom Dataset
 class SegmentationDataset(Dataset):
@@ -211,7 +235,7 @@ def apply_densecrf(image_tensor, prob_map):
     return torch.from_numpy(pred.astype(np.float32))[None, ...]
 
 # Training Function
-def train_epoch(model, dataloader, criterion, optimizer, device, mixup_alpha=0.0):
+def train_epoch(model, dataloader, criterion, optimizer, device, mixup_alpha=0.0, use_amp=False, scaler=None, grad_accum_steps=1):
     model.train()
     total_loss = 0
     total_f1 = 0
@@ -229,14 +253,26 @@ def train_epoch(model, dataloader, criterion, optimizer, device, mixup_alpha=0.0
             batch_indices = torch.randperm(images.size(0)).to(device)
             images_mix = lam * images + (1 - lam) * images[batch_indices]
             masks_mix = lam * masks + (1 - lam) * masks[batch_indices]
-            outputs = model(images_mix)
-            loss = criterion(outputs, masks_mix)
+            with autocast(enabled=use_amp):
+                outputs = model(images_mix)
+                loss = criterion(outputs, masks_mix)
         else:
-            outputs = model(images)
-            loss = criterion(outputs, masks)
+            with autocast(enabled=use_amp):
+                outputs = model(images)
+                loss = criterion(outputs, masks)
         
-        loss.backward()
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
+        if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad() # Clear gradients after each step
         
         # Calculate metrics
         f1, iou, dice = calculate_metrics(outputs, masks)
@@ -550,8 +586,17 @@ def main():
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Save directory')
     parser.add_argument('--log_dir', type=str, default='./runs', help='TensorBoard log dir')
     parser.add_argument('--num_workers', type=int, default=2, help='Number of DataLoader workers')
+    parser.add_argument('--grad_accum_steps', type=int, default=1, help='Gradient accumulation steps (effective batch size = batch_size * grad_accum_steps)')
+    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision (AMP) for faster training')
+    parser.add_argument('--pin_memory', action='store_true', default=True, help='Pin memory for faster GPU transfer')
+    parser.add_argument('--persistent_workers', action='store_true', help='Keep DataLoader workers alive between epochs')
     
     args = parser.parse_args()
+    
+    # Override AMP setting if specified
+    if args.use_amp:
+        use_amp = args.use_amp
+        print(f"AMP manually enabled: {use_amp}")
     
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
@@ -573,9 +618,24 @@ def main():
         aug=val_aug
     )
     
-    # Data loaders
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    # Data loaders with Kaggle optimizations
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=args.num_workers, 
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers and args.num_workers > 0,
+        drop_last=True  # Helps with gradient accumulation
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.num_workers, 
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers and args.num_workers > 0
+    )
     
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
@@ -611,6 +671,11 @@ def main():
     # Scheduler
     scheduler = get_scheduler(optimizer, args.scheduler, args.epochs)
     
+    # Initialize GradScaler for AMP if enabled
+    scaler = GradScaler() if use_amp else None
+    if use_amp:
+        print("GradScaler initialized for AMP training")
+    
     # Training history
     train_metrics = {'loss': [], 'f1': [], 'iou': [], 'dice': []}
     val_metrics = {'loss': [], 'f1': [], 'iou': [], 'dice': []}
@@ -629,11 +694,32 @@ def main():
         print(f"Resumed from epoch {start_epoch} with best F1: {best_f1:.4f}, best IoU: {best_iou:.4f}")
     
     print(f"Starting training from epoch {start_epoch + 1}")
+    print(f"Effective batch size: {args.batch_size * args.grad_accum_steps}")
+    print(f"AMP enabled: {use_amp}")
+    
+    # Display detailed GPU info for Kaggle
+    if torch.cuda.is_available():
+        print("\n" + "="*50)
+        print("GPU INFORMATION FOR KAGGLE")
+        print("="*50)
+        print(f"GPU Name: {torch.cuda.get_device_name()}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"CUDA Version: {torch.version.cuda}")
+        print(f"PyTorch Version: {torch.__version__}")
+        print(f"AMP Available: {use_amp}")
+        print(f"Grad Accum Steps: {args.grad_accum_steps}")
+        print(f"Effective Batch Size: {args.batch_size * args.grad_accum_steps}")
+        print("="*50 + "\n")
     
     # Training loop
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print("-" * 50)
+        
+        # Clear GPU cache periodically for Kaggle
+        if torch.cuda.is_available() and epoch % 5 == 0:
+            torch.cuda.empty_cache()
+            print("GPU cache cleared")
         
         # Optionally freeze backbone for warmup epochs
         if args.freeze_backbone_epochs > 0 and epoch < args.freeze_backbone_epochs:
@@ -643,8 +729,27 @@ def main():
             if hasattr(model, 'unfreeze_backbone'):
                 model.unfreeze_backbone()
 
-        # Train
-        train_results = train_epoch(model, train_loader, criterion, optimizer, device, mixup_alpha=args.mixup_alpha)
+        # Train with AMP and gradient accumulation
+        try:
+            train_results = train_epoch(
+                model, train_loader, criterion, optimizer, device, 
+                mixup_alpha=args.mixup_alpha, 
+                use_amp=use_amp, 
+                scaler=scaler,
+                grad_accum_steps=args.grad_accum_steps
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"GPU OOM error: {e}")
+                print("Trying to clear cache and reduce batch size...")
+                torch.cuda.empty_cache()
+                # Reduce effective batch size for next epoch
+                if args.grad_accum_steps < 4:
+                    args.grad_accum_steps += 1
+                    print(f"Increased gradient accumulation steps to {args.grad_accum_steps}")
+                continue
+            else:
+                raise e
         
         # Validate
         vis_dir = os.path.join(args.save_dir, 'viz')
@@ -733,3 +838,43 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# ============================================================================
+# KAGGLE NOTEBOOK INSTRUCTIONS
+# ============================================================================
+# 
+# Untuk menjalankan training di Kaggle Notebook dengan GPU:
+# 
+# 1. Pastikan dataset sudah diupload ke /kaggle/input/ atau gunakan dataset API
+# 2. Install dependencies:
+#    !pip install -r requirements.txt
+# 
+# 3. Contoh command training dengan optimasi GPU:
+#    !python train.py \
+#      --epochs 200 \
+#      --batch_size 16 \
+#      --image_size 512 384 \
+#      --lr 1e-4 \
+#      --scheduler cosine \
+#      --backbone mobilenetv3_small_075 \
+#      --base_channels 16 \
+#      --postprocess crf \
+#      --threshold_search \
+#      --freeze_backbone_epochs 5 \
+#      --mixup_alpha 0.2 \
+#      --early_patience 30 \
+#      --num_workers 4 \
+#      --use_amp \
+#      --grad_accum_steps 2 \
+#      --persistent_workers \
+#      --data_dir /kaggle/input/your-dataset \
+#      --save_dir /kaggle/working/checkpoints \
+#      --log_dir /kaggle/working/runs
+# 
+# 4. Untuk monitoring GPU usage:
+#    !nvidia-smi
+#    !watch -n 1 nvidia-smi
+# 
+# 5. Jika terjadi OOM, kurangi batch_size atau tambah grad_accum_steps
+# 
+# ============================================================================

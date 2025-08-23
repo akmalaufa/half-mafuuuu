@@ -1,0 +1,45 @@
+# Kaggle-optimized requirements for Half-MAFU-Net
+# These versions are tested and optimized for Kaggle GPU environment
+
+# Core PyTorch (optimized for Kaggle)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data processing
+numpy>=1.21.0
+Pillow>=8.3.0
+opencv-python>=4.6.0
+
+# Machine learning
+scikit-learn>=1.1.0
+
+# Visualization and logging
+matplotlib>=3.5.0
+seaborn>=0.12.0
+tensorboard>=2.10.0
+
+# Progress bars
+tqdm>=4.64.0
+
+# Image augmentation
+albumentations>=1.3.0
+
+# Model backbones
+timm==1.0.19
+
+# Model analysis
+thop>=0.1.1.post220907
+
+# Optional: CRF post-processing (install separately if needed)
+# scikit-build
+# ninja
+# cmake
+# cython
+# pydensecrf @ git+https://github.com/lucasb-eyer/pydensecrf.git
+
+# Kaggle-specific optimizations
+# These are usually pre-installed in Kaggle but listed for reference
+# jupyter
+# ipykernel
+# pandas
+# scipy

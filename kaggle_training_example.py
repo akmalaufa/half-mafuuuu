@@ -42,9 +42,90 @@ def setup_kaggle_environment():
     
     print("Kaggle directories created successfully!")
 
+def find_dataset_path():
+    """Automatically find dataset path in Kaggle"""
+    print("Searching for dataset...")
+    
+    # Common Kaggle dataset paths
+    possible_paths = [
+        "/kaggle/input",
+        "/kaggle/input/*",
+        "/kaggle/working",
+        "."
+    ]
+    
+    # Search for dataset structure
+    for base_path in possible_paths:
+        if base_path == "/kaggle/input/*":
+            # Check all subdirectories in /kaggle/input
+            try:
+                input_dirs = os.listdir("/kaggle/input")
+                for dir_name in input_dirs:
+                    full_path = os.path.join("/kaggle/input", dir_name)
+                    if os.path.isdir(full_path):
+                        # Check if this looks like our dataset
+                        train_images = os.path.join(full_path, "train", "images")
+                        train_masks = os.path.join(full_path, "train", "masks")
+                        val_images = os.path.join(full_path, "val", "images")
+                        val_masks = os.path.join(full_path, "val", "masks")
+                        
+                        if (os.path.exists(train_images) and os.path.exists(train_masks) and 
+                            os.path.exists(val_images) and os.path.exists(val_masks)):
+                            print(f"Found dataset at: {full_path}")
+                            return full_path
+            except Exception as e:
+                print(f"Error checking /kaggle/input: {e}")
+                continue
+        else:
+            # Check specific path
+            if os.path.exists(base_path):
+                # Check if this directory contains our dataset structure
+                train_images = os.path.join(base_path, "train", "images")
+                train_masks = os.path.join(base_path, "train", "masks")
+                val_images = os.path.join(base_path, "val", "images")
+                val_masks = os.path.join(base_path, "val", "masks")
+                
+                if (os.path.exists(train_images) and os.path.exists(train_masks) and 
+                    os.path.exists(val_images) and os.path.exists(val_masks)):
+                    print(f"Found dataset at: {base_path}")
+                    return base_path
+    
+    # If no dataset found, ask user
+    print("\n" + "="*60)
+    print("DATASET NOT FOUND AUTOMATICALLY!")
+    print("="*60)
+    print("Please provide the correct dataset path.")
+    print("\nPossible locations:")
+    print("1. Upload dataset to Kaggle and use /kaggle/input/your-dataset-name")
+    print("2. Use Kaggle Dataset API")
+    print("3. Place dataset in current directory")
+    
+    # List available datasets in /kaggle/input
+    try:
+        if os.path.exists("/kaggle/input"):
+            print("\nAvailable datasets in /kaggle/input:")
+            input_dirs = os.listdir("/kaggle/input")
+            for dir_name in input_dirs:
+                full_path = os.path.join("/kaggle/input", dir_name)
+                if os.path.isdir(full_path):
+                    print(f"  - {dir_name}: {full_path}")
+    except Exception as e:
+        print(f"Error listing /kaggle/input: {e}")
+    
+    print("\n" + "="*60)
+    return None
+
 def run_training():
     """Run the training with optimal Kaggle settings"""
     print("Starting training with Kaggle optimizations...")
+    
+    # Find dataset path
+    dataset_path = find_dataset_path()
+    if dataset_path is None:
+        print("Cannot proceed without dataset. Please upload dataset to Kaggle first.")
+        return False
+    
+    print(f"Using dataset at: {dataset_path}")
     
     # Stage A: Initial training with MixUp
     print("\n" + "="*60)
@@ -69,7 +150,7 @@ def run_training():
         "--use_amp",  # Enable Automatic Mixed Precision
         "--grad_accum_steps", "2",  # Gradient accumulation
         "--persistent_workers",  # Keep workers alive
-        "--data_dir", "/kaggle/input/your-dataset",  # Update this path
+        "--data_dir", dataset_path,  # Use detected dataset path
         "--save_dir", "/kaggle/working/checkpoints/stage_a",
         "--log_dir", "/kaggle/working/runs/stage_a"
     ]
@@ -108,7 +189,7 @@ def run_training():
         "--use_amp",
         "--grad_accum_steps", "2",
         "--persistent_workers",
-        "--data_dir", "/kaggle/input/your-dataset",  # Update this path
+        "--data_dir", dataset_path,  # Use detected dataset path
         "--save_dir", "/kaggle/working/checkpoints/stage_b",
         "--log_dir", "/kaggle/working/runs/stage_b"
     ]

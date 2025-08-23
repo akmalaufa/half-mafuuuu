@@ -44,11 +44,30 @@ Panduan lengkap untuk training model Half-MAFU-Net di Kaggle dengan optimasi GPU
 !pip install "pydensecrf @ git+https://github.com/lucasb-eyer/pydensecrf.git"
 ```
 
-## 🎯 Training Commands
+## 🎯 Cara Training
 
-### Stage A: Initial Training (dengan MixUp)
+### **Option 1: Script Otomatis (Recommended)**
 ```bash
-python train.py \
+# Jalankan script yang akan mendeteksi dataset otomatis
+!python kaggle_training_example.py
+```
+
+### **Option 2: Script Manual dengan Path Input**
+```bash
+# Jalankan dengan dataset path yang spesifik
+!python kaggle_train_simple.py --data_dir /kaggle/input/your-dataset-name
+
+# Atau dengan parameter custom
+!python kaggle_train_simple.py \
+  --data_dir /kaggle/input/your-dataset \
+  --epochs 150 \
+  --batch_size 12
+```
+
+### **Option 3: Command Manual**
+```bash
+# Stage A: Initial Training (dengan MixUp)
+!python train.py \
   --epochs 200 \
   --batch_size 16 \
   --image_size 512 384 \
@@ -68,11 +87,9 @@ python train.py \
   --data_dir /kaggle/input/your-dataset \
   --save_dir /kaggle/working/checkpoints/stage_a \
   --log_dir /kaggle/working/runs/stage_a
-```
 
-### Stage B: Fine-tuning (tanpa MixUp)
-```bash
-python train.py \
+# Stage B: Fine-tuning (tanpa MixUp)
+!python train.py \
   --epochs 100 \
   --batch_size 16 \
   --image_size 512 384 \
@@ -131,6 +148,16 @@ print(f"TensorBoard: {url}")
 ```
 
 ## 🚨 Troubleshooting
+
+### Dataset Path Error
+```bash
+# Error: FileNotFoundError: No such file or directory
+# Solusi: Gunakan script yang mendeteksi dataset otomatis
+!python kaggle_training_example.py
+
+# Atau berikan path yang benar
+!python kaggle_train_simple.py --data_dir /kaggle/input/your-actual-dataset-name
+```
 
 ### GPU Out of Memory (OOM)
 ```bash
@@ -194,30 +221,47 @@ Dengan optimasi ini, target yang diharapkan:
 
 ## 🔄 Quick Start
 
-Untuk training cepat dengan semua optimasi:
-
+### **Untuk Pemula (Recommended):**
 ```python
-# Jalankan script otomatis
+# 1. Upload dataset ke Kaggle
+# 2. Jalankan script otomatis
 !python kaggle_training_example.py
+```
 
-# Atau copy-paste command manual
+### **Untuk Advanced User:**
+```python
+# 1. Install dependencies
+!pip install -r requirements-kaggle.txt
+
+# 2. Jalankan dengan path spesifik
+!python kaggle_train_simple.py --data_dir /kaggle/input/your-dataset
+
+# 3. Atau command manual
 !python train.py --epochs 200 --batch_size 16 --use_amp --grad_accum_steps 2 --data_dir /kaggle/input/your-dataset
 ```
 
 ## 📝 Notes
 
-1. **Dataset Path**: Ganti `/kaggle/input/your-dataset` dengan path dataset yang sebenarnya
+1. **Dataset Path**: Script otomatis akan mendeteksi dataset
 2. **GPU Runtime**: Pastikan notebook menggunakan GPU runtime
 3. **Memory**: Script otomatis handle GPU memory management
 4. **Resume**: Bisa resume training dari checkpoint jika terputus
+5. **Error Handling**: Script sudah include error handling untuk OOM dan path issues
 
 ## 🆘 Support
 
 Jika ada masalah:
-1. Cek GPU memory dengan `nvidia-smi`
-2. Pastikan semua dependencies terinstall
-3. Cek log error di console
-4. Kurangi batch_size jika OOM
-5. Gunakan `--help` untuk melihat semua options
+1. **Dataset Path**: Gunakan `kaggle_training_example.py` untuk deteksi otomatis
+2. **GPU Memory**: Cek dengan `!nvidia-smi`
+3. **Dependencies**: Pastikan semua packages terinstall
+4. **Log Error**: Cek console output untuk error details
+5. **Batch Size**: Kurangi jika OOM terjadi
+
+## 📚 Script Files
+
+- **`kaggle_training_example.py`** - Script otomatis dengan deteksi dataset
+- **`kaggle_train_simple.py`** - Script manual dengan command line arguments
+- **`train.py`** - Script training utama dengan semua optimasi
+- **`requirements-kaggle.txt`** - Dependencies untuk Kaggle
 
 Happy Training! 🚀
